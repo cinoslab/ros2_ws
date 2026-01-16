@@ -1,0 +1,20 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>wicom_roboarm</name>
+  <version>0.2.0</version>
+  <description>ROS2 node to control servos via PCA9685 (minimal port, no custom rosidl interfaces).</description>
+
+  <maintainer email="phuocnguyen.bk62@gmail.com">cinos</maintainer>
+  <license>MIT</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <depend>rclpy</depend>
+  <depend>sensor_msgs</depend>
+  <depend>geometry_msgs</depend>
+  <depend>std_srvs</depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

@@ -1,0 +1,25 @@
+wicom_roboarm_unified:
+  ros__parameters:
+    i2c_bus: 1
+    i2c_address: 0x40
+    pwm_frequency_hz: 50.0
+    oscillator_hz: 25000000
+
+    enable_on_start: false
+    command_timeout_sec: 1.0
+    timeout_behavior: "hold"
+    shutdown_behavior: "neutral"
+
+    pulse_us_min: 600.0
+    pulse_us_max: 2400.0
+
+    joint_names: ["base", "shoulder", "elbow", "wrist_pitch", "gripper"]
+    channels:    [0, 1, 2, 3, 4]
+
+    neutral_deg: 30.0
+    neutral_deg_by_joint: [90.0, 30.0, 0.0, 180.0, 0.0]
+
+    limits_min_deg_by_joint: [0.0, 10.0, 0.0, 0.0, 10.0]
+    limits_max_deg_by_joint: [180.0, 170.0, 180.0, 180.0, 170.0]
+
+    publish_rate_hz: 10.0
