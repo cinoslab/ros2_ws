@@ -10,16 +10,28 @@ wicom_roboarm_unified:
     timeout_behavior: "hold"
     shutdown_behavior: "neutral"
 
-    pulse_us_min: 600.0
-    pulse_us_max: 2400.0
+    # Updated to match test1servo.py behavior
+    pulse_us_min: 500.0
+    pulse_us_max: 2500.0
+    period_us: 20000.0
 
-    joint_names: ["base", "shoulder", "elbow", "wrist_pitch", "gripper"]
-    channels:    [0, 1, 2, 3, 4]
+    # New joint structure (6 joints) controlling 7 servos (one mirrored pair)
+    # Channels are the "primary" channel for each joint.
+    # Shoulder uses channel=1 and mirrors to shoulder_mirror_channel=2.
+    joint_names: ["base", "shoulder", "elbow", "wrist_roll", "wrist_pitch", "pen"]
+    channels:    [0,      1,          3,      4,           5,            6]
 
-    neutral_deg: 30.0
-    neutral_deg_by_joint: [90.0, 30.0, 0.0, 180.0, 0.0]
+    # Mirrored shoulder: setting 'shoulder' sets CH1 and CH2 (mirrored)
+    shoulder_mirror_enabled: true
+    shoulder_joint_name: "shoulder"
+    shoulder_mirror_channel: 2
+    shoulder_mirror_angle_max: 180.0
 
-    limits_min_deg_by_joint: [0.0, 10.0, 0.0, 0.0, 10.0]
-    limits_max_deg_by_joint: [180.0, 170.0, 180.0, 180.0, 170.0]
+    # Keep old style neutral/limits arrays aligned with joint_names above
+    neutral_deg: 90.0
+    neutral_deg_by_joint: [90.0, 90.0, 90.0, 90.0, 90.0, 90.0]
+
+    limits_min_deg_by_joint: [0.0,  0.0,  0.0,  0.0,  0.0,  0.0]
+    limits_max_deg_by_joint: [180.0, 180.0, 180.0, 180.0, 180.0, 180.0]
 
     publish_rate_hz: 10.0

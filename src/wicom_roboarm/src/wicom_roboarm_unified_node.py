@@ -155,8 +155,12 @@ class UnifiedRoboArmNode(Node):
         self.declare_parameter("enable_on_start", False)
         self.declare_parameter("use_mux", True)
 
-        self.declare_parameter("pulse_us_min", 600.0)
-        self.declare_parameter("pulse_us_max", 2400.0)
+        # UPDATED: use pulse min/max like test1servo.py
+        self.declare_parameter("pulse_us_min", 500.0)
+        self.declare_parameter("pulse_us_max", 2500.0)
+
+        # period_us default 20ms for 50Hz like test1servo.py
+        self.declare_parameter("period_us", 20000.0)
 
         self.declare_parameter("neutral_deg", 30.0)
 
@@ -173,6 +177,13 @@ class UnifiedRoboArmNode(Node):
         self.declare_parameter("command_timeout_sec", 1.0)
         self.declare_parameter("timeout_behavior", "hold")     # hold|neutral|off
         self.declare_parameter("shutdown_behavior", "neutral") # hold|neutral|off
+
+        # NEW: mirrored shoulder support (one joint controls two channels)
+        self.declare_parameter("shoulder_mirror_enabled", False)
+        self.declare_parameter("shoulder_joint_name", "shoulder")
+        self.declare_parameter("shoulder_mirror_channel", 2)  # the second servo channel
+        # mirror formula: angle_mirror = mirror_angle_max - angle
+        self.declare_parameter("shoulder_mirror_angle_max", 180.0)
 
         # -------- Parameters (VL53 sensors) ----------
         self.declare_parameter("vl53_publish_rate_hz", 15.0)
@@ -193,14 +204,22 @@ class UnifiedRoboArmNode(Node):
         self.enable_on_start = bool(self.get_parameter("enable_on_start").value)
         self.use_mux         = bool(self.get_parameter("use_mux").value)
 
+        # UPDATED
         self.pulse_us_min    = float(self.get_parameter("pulse_us_min").value)
         self.pulse_us_max    = float(self.get_parameter("pulse_us_max").value)
+        self.period_us       = float(self.get_parameter("period_us").value)
+
         self.neutral_deg     = float(self.get_parameter("neutral_deg").value)
 
         self.publish_rate_hz = float(self.get_parameter("publish_rate_hz").value)
         self.command_timeout_sec = float(self.get_parameter("command_timeout_sec").value)
         self.timeout_behavior    = str(self.get_parameter("timeout_behavior").value)
         self.shutdown_behavior   = str(self.get_parameter("shutdown_behavior").value)
+
+        self.shoulder_mirror_enabled = bool(self.get_parameter("shoulder_mirror_enabled").value)
+        self.shoulder_joint_name = str(self.get_parameter("shoulder_joint_name").value)
+        self.shoulder_mirror_channel = _parse_int(self.get_parameter("shoulder_mirror_channel").value, 2)
+        self.shoulder_mirror_angle_max = float(self.get_parameter("shoulder_mirror_angle_max").value)
 
         joint_names = list(self.get_parameter("joint_names").value)
         channels = list(self.get_parameter("channels").value)
@@ -324,26 +343,50 @@ class UnifiedRoboArmNode(Node):
         self.get_logger().info(
             f"Unified RoboArm started: joints={self.joint_names} channels={self.channels} "
             f"PCA9685=0x{self.pca_address:02X} mux=0x{self.mux_address:02X} servo_mux_ch={self.servo_mux_chan} "
-            f"pwm={self.pwm_freq:.1f}Hz enabled={self.enabled}"
+            f"pwm={self.pwm_freq:.1f}Hz enabled={self.enabled} "
+            f"pulse_us=[{self.pulse_us_min:.1f},{self.pulse_us_max:.1f}] period_us={self.period_us:.1f} "
+            f"shoulder_mirror={self.shoulder_mirror_enabled}"
         )
 
     def _now_s(self) -> float:
         return self.get_clock().now().nanoseconds / 1e9
 
-    def angle_to_count(self, angle_deg: float) -> int:
-        span_us = self.pulse_us_max - self.pulse_us_min
-        frac = max(0.0, min(1.0, angle_deg / 180.0))
-        pulse_us = self.pulse_us_min + frac * span_us
-        counts = int(round((pulse_us / 1e6) * self.pwm_freq * 4096.0))
+    # UPDATED: follow test1servo semantics (MIN_US/MAX_US/PERIOD_US),
+    # but convert to PCA9685 12-bit "off count" (0..4095).
+    def _pulse_us_for_angle(self, angle_deg: float) -> float:
+        angle = max(0.0, min(180.0, float(angle_deg)))
+        return self.pulse_us_min + (angle / 180.0) * (self.pulse_us_max - self.pulse_us_min)
+
+    def _pulse_us_to_counts(self, pulse_us: float) -> int:
+        # counts = pulse_us / period_us * 4096
+        if self.period_us <= 0:
+            self.period_us = 20000.0
+        counts = int(round((float(pulse_us) / float(self.period_us)) * 4096.0))
         return max(0, min(4095, counts))
 
-    def apply_joint(self, idx: int, angle_deg: float):
-        ch = self.channel_by_idx[idx]
+    def angle_to_count(self, angle_deg: float) -> int:
+        return self._pulse_us_to_counts(self._pulse_us_for_angle(angle_deg))
+
+    def apply_channel_angle(self, channel: int, angle_deg: float):
         counts = self.angle_to_count(angle_deg)
         with self.lock:
             if self.use_mux:
                 self._select_mux(self.servo_mux_chan)
-            self.pca.set_pwm(ch, 0, counts)
+            self.pca.set_pwm(channel, 0, counts)
+
+    def apply_joint(self, idx: int, angle_deg: float):
+        ch = self.channel_by_idx[idx]
+        self.apply_channel_angle(ch, angle_deg)
+
+        # NEW: shoulder mirror (setting one sets both)
+        try:
+            joint_name = self.joint_names[idx]
+        except Exception:
+            joint_name = ""
+
+        if self.shoulder_mirror_enabled and joint_name == self.shoulder_joint_name:
+            mirror_angle = self.shoulder_mirror_angle_max - float(angle_deg)
+            self.apply_channel_angle(self.shoulder_mirror_channel, mirror_angle)
 
     def _move_to_neutral(self, idx: int):
         neutral = self.neutral_deg_by_idx[idx]
@@ -356,6 +399,17 @@ class UnifiedRoboArmNode(Node):
             if self.use_mux:
                 self._select_mux(self.servo_mux_chan)
             self.pca.set_off(ch)
+
+        # if shoulder, also turn off mirror channel
+        try:
+            joint_name = self.joint_names[idx]
+        except Exception:
+            joint_name = ""
+        if self.shoulder_mirror_enabled and joint_name == self.shoulder_joint_name:
+            with self.lock:
+                if self.use_mux:
+                    self._select_mux(self.servo_mux_chan)
+                self.pca.set_off(self.shoulder_mirror_channel)
 
     def _apply_behavior_all(self, behavior: str):
         for idx in range(self.num_joints):

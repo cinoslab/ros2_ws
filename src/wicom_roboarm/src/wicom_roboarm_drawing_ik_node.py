@@ -1,338 +1,276 @@
 #!/usr/bin/env python3
 import math
+import time
 
 import rclpy
 from rclpy.node import Node
 
 from geometry_msgs.msg import Point
-from sensor_msgs.msg import JointState, Range
+from sensor_msgs.msg import JointState
 
 
-class RoboArmDrawingIKNode(Node):
+def clamp(x, lo, hi):
+    return max(lo, min(hi, x))
+
+
+def wrap_pi(a):
+    while a > math.pi:
+        a -= 2.0 * math.pi
+    while a < -math.pi:
+        a += 2.0 * math.pi
+    return a
+
+
+def rotz(a):
+    ca, sa = math.cos(a), math.sin(a)
+    return [[ca, -sa, 0.0], [sa, ca, 0.0], [0.0, 0.0, 1.0]]
+
+
+def roty(a):
+    ca, sa = math.cos(a), math.sin(a)
+    return [[ca, 0.0, sa], [0.0, 1.0, 0.0], [-sa, 0.0, ca]]
+
+
+def matmul(A, B):
+    return [
+        [A[i][0] * B[0][j] + A[i][1] * B[1][j] + A[i][2] * B[2][j] for j in range(3)]
+        for i in range(3)
+    ]
+
+
+def matT(A):
+    return [[A[0][0], A[1][0], A[2][0]], [A[0][1], A[1][1], A[2][1]], [A[0][2], A[1][2], A[2][2]]]
+
+
+class RoboArmIKXYZNode(Node):
     """
-    ROS2 node that mirrors Unity client's mapping + IK:
-      - Input: UV (0..1) + penDown via geometry_msgs/Point (x=u, y=v, z=penDown 0/1)
-      - zPlane_cm:
-          * Fixed mode (default): zPlane_cm_default (+ z_offset_cm)
-          * Sensor mode: from VL53 long range topic (m -> cm) + offset
-            controlled by use_vl53_for_z
-      - Solve IK and publish JointState to servo controller command topic
+    Strategy (so you can calibrate from real results):
+      1) solve IK -> q_geo (deg) (can be negative)
+      2) map to servo cmd with per-joint sign and home:
+            cmd = home + sign * q_geo
+         (NO other assumptions)
+      3) print both IK and CMD
+      4) publish CMD to /pca9685_servo/command
+
+    You can change sign_* params at runtime to fix direction without touching IK math.
     """
 
     def __init__(self):
-        super().__init__("wicom_roboarm_drawing_ik")
+        super().__init__("wicom_roboarm_ik_xyz")
 
-        # ---------- Params ----------
-        self.declare_parameter("L1_cm", 6.0)
-        self.declare_parameter("L2_cm", 5.5)
-        self.declare_parameter("L3_cm", 5.5)
+        # Geometry (cm)
+        self.declare_parameter("d1_base_to_shoulder_cm", 4.0)
+        self.declare_parameter("L2_shoulder_to_elbow_cm", 12.0)
+        self.declare_parameter("L3_elbow_to_wristpitch_cm", 14.0)  # 6 + 8
+        self.declare_parameter("L_tool_from_wristpitch_to_tip_cm", 13.0)  # 6.5 + 6.5
 
-        self.declare_parameter("elbow_up", False)
-        self.declare_parameter("z_offset_cm", 2.0)
-        self.declare_parameter("zPlane_cm_default", 15.0)
-        self.declare_parameter("use_yspan_as_draw_area", True)
+        # Topics
+        self.declare_parameter("xyz_input_topic", "/target_xyz_cm")
+        self.declare_parameter("servo_command_topic", "/pca9685_servo/command")
 
-        # ONLY CHANGE: toggle using sensor Z (default OFF => fixed z)
-        self.declare_parameter("use_vl53_for_z", False)
-
-        self.declare_parameter("send_interval_sec", 0.5)
-
-        self.declare_parameter("base_scale", 1.5)
-        self.declare_parameter("shoulder_scale", 1.25)
-        self.declare_parameter("elbow_scale", 1.25)
-        self.declare_parameter("wrist_scale", 1.25)
-
-        self.declare_parameter("base_offset_deg", 90.0)
-        self.declare_parameter("shoulder_offset_deg", 90.0)
-        self.declare_parameter("elbow_offset_deg", 180.0)
-        self.declare_parameter("wrist_offset_deg", 100.0)
-
+        # Joint names
         self.declare_parameter("joint_name_base", "base")
         self.declare_parameter("joint_name_shoulder", "shoulder")
         self.declare_parameter("joint_name_elbow", "elbow")
-        self.declare_parameter("joint_name_wrist", "wrist_pitch")
+        self.declare_parameter("joint_name_wrist_roll", "wrist_roll")
+        self.declare_parameter("joint_name_wrist_pitch", "wrist_pitch")
+        self.declare_parameter("joint_name_pen", "pen")
 
-        self.declare_parameter("servo_command_topic", "/pca9685_servo/command")
+        # Home and sign (calibration knobs)
+        self.declare_parameter("home_deg", 90.0)
+        self.declare_parameter("sign_base", 1.0)
+        self.declare_parameter("sign_shoulder", 1.0)
+        self.declare_parameter("sign_elbow", 1.0)
+        self.declare_parameter("sign_wrist_roll", 1.0)
+        self.declare_parameter("sign_wrist_pitch", 1.0)
+        self.declare_parameter("sign_pen", 1.0)
 
-        self.declare_parameter("input_uv_topic", "input_uv")
-        self.declare_parameter("vl53_long_topic", "/vl53/long_range")
+        # branch selection / stability
+        self.declare_parameter("elbow_up", False)
+        self.declare_parameter("pen_roll_deg_default", 0.0)
 
-        self.declare_parameter("auto_draw", False)
-        self.declare_parameter("auto_loop", True)
-        self.declare_parameter("auto_point_interval", 0.2)
-        self.declare_parameter("auto_square_side_uv", 0.25)
-        self.declare_parameter("auto_points_per_side", 20)
+        # publish rate limit (avoid spamming the driver)
+        self.declare_parameter("max_publish_hz", 5.0)
 
-        # read params
-        self.L1_cm = float(self.get_parameter("L1_cm").value)
-        self.L2_cm = float(self.get_parameter("L2_cm").value)
-        self.L3_cm = float(self.get_parameter("L3_cm").value)
+        # Read params
+        self.d1 = float(self.get_parameter("d1_base_to_shoulder_cm").value)
+        self.L2 = float(self.get_parameter("L2_shoulder_to_elbow_cm").value)
+        self.L3 = float(self.get_parameter("L3_elbow_to_wristpitch_cm").value)
+        self.Ltool = float(self.get_parameter("L_tool_from_wristpitch_to_tip_cm").value)
+
+        self.xyz_topic = str(self.get_parameter("xyz_input_topic").value)
+        self.cmd_topic = str(self.get_parameter("servo_command_topic").value)
+
+        self.j_base = str(self.get_parameter("joint_name_base").value)
+        self.j_shoulder = str(self.get_parameter("joint_name_shoulder").value)
+        self.j_elbow = str(self.get_parameter("joint_name_elbow").value)
+        self.j_wroll = str(self.get_parameter("joint_name_wrist_roll").value)
+        self.j_wpitch = str(self.get_parameter("joint_name_wrist_pitch").value)
+        self.j_pen = str(self.get_parameter("joint_name_pen").value)
+
+        self.home = float(self.get_parameter("home_deg").value)
+        self.sign_base = float(self.get_parameter("sign_base").value)
+        self.sign_sh = float(self.get_parameter("sign_shoulder").value)
+        self.sign_el = float(self.get_parameter("sign_elbow").value)
+        self.sign_wr = float(self.get_parameter("sign_wrist_roll").value)
+        self.sign_wp = float(self.get_parameter("sign_wrist_pitch").value)
+        self.sign_pen = float(self.get_parameter("sign_pen").value)
 
         self.elbow_up = bool(self.get_parameter("elbow_up").value)
-        self.z_offset_cm = float(self.get_parameter("z_offset_cm").value)
-        self.zPlane_cm_default = float(self.get_parameter("zPlane_cm_default").value)
-        self.use_yspan_as_draw_area = bool(self.get_parameter("use_yspan_as_draw_area").value)
+        self.pen_roll_default = math.radians(float(self.get_parameter("pen_roll_deg_default").value))
 
-        self.use_vl53_for_z = bool(self.get_parameter("use_vl53_for_z").value)
+        self.max_hz = float(self.get_parameter("max_publish_hz").value)
+        self._min_period = 1.0 / self.max_hz if self.max_hz > 0 else 0.0
+        self._last_pub_t = 0.0
 
-        self.send_interval = float(self.get_parameter("send_interval_sec").value)
+        self._last_q = None
 
-        self.base_scale = float(self.get_parameter("base_scale").value)
-        self.shoulder_scale = float(self.get_parameter("shoulder_scale").value)
-        self.elbow_scale = float(self.get_parameter("elbow_scale").value)
-        self.wrist_scale = float(self.get_parameter("wrist_scale").value)
-
-        self.base_offset_deg = float(self.get_parameter("base_offset_deg").value)
-        self.shoulder_offset_deg = float(self.get_parameter("shoulder_offset_deg").value)
-        self.elbow_offset_deg = float(self.get_parameter("elbow_offset_deg").value)
-        self.wrist_offset_deg = float(self.get_parameter("wrist_offset_deg").value)
-
-        self.joint_name_base = str(self.get_parameter("joint_name_base").value)
-        self.joint_name_shoulder = str(self.get_parameter("joint_name_shoulder").value)
-        self.joint_name_elbow = str(self.get_parameter("joint_name_elbow").value)
-        self.joint_name_wrist = str(self.get_parameter("joint_name_wrist").value)
-
-        self.servo_command_topic = str(self.get_parameter("servo_command_topic").value)
-        self.uv_topic = str(self.get_parameter("input_uv_topic").value)
-        self.vl53_long_topic = str(self.get_parameter("vl53_long_topic").value)
-
-        self.auto_draw = bool(self.get_parameter("auto_draw").value)
-        self.auto_loop = bool(self.get_parameter("auto_loop").value)
-        self.auto_point_interval = float(self.get_parameter("auto_point_interval").value)
-        self.auto_square_side_uv = float(self.get_parameter("auto_square_side_uv").value)
-        self.auto_points_per_side = int(self.get_parameter("auto_points_per_side").value)
-
-        # ---------- State ----------
-        self._zPlane_cm_fixed = self.zPlane_cm_default + self.z_offset_cm
-        self._zPlane_cm = self._zPlane_cm_fixed
-
-        self._have_uv = False
-        self._last_u = 0.5
-        self._last_v = 0.5
-        self._last_pen_down = False
-
-        self._last_send_time = 0.0
-
-        # Auto path
-        self._auto_path = []
-        self._auto_index = 0
-        self._auto_next_time = self.get_clock().now().nanoseconds / 1e9
-
-        # ---------- Pub/Sub ----------
-        self.pub_debug_target = self.create_publisher(Point, "debug_target_cm", 10)
-        self.pub_debug_angles = self.create_publisher(JointState, "debug_angles", 10)
-
-        self.pub_servo_cmd = self.create_publisher(JointState, self.servo_command_topic, 10)
-
-        self.sub_uv = self.create_subscription(Point, self.uv_topic, self._on_uv, 10)
-        self.sub_vl53 = self.create_subscription(Range, self.vl53_long_topic, self._on_vl53_long, 10)
-
-        # Timer 50 Hz internal loop
-        self.timer = self.create_timer(0.02, self._tick)
-
-        if self.auto_draw:
-            self._build_auto_square_path()
+        self.pub_cmd = self.create_publisher(JointState, self.cmd_topic, 10)
+        self.sub_xyz = self.create_subscription(Point, self.xyz_topic, self._on_xyz, 10)
 
         self.get_logger().info(
-            f"DrawingIK node started. input_uv={self.uv_topic} vl53_long={self.vl53_long_topic} "
-            f"servo_command_topic={self.servo_command_topic} auto_draw={self.auto_draw} "
-            f"use_vl53_for_z={self.use_vl53_for_z} z_fixed={self._zPlane_cm_fixed:.2f}cm"
+            f"IK XYZ node started. xyz_topic={self.xyz_topic} cmd_topic={self.cmd_topic} "
+            f"home={self.home} signs=[{self.sign_base},{self.sign_sh},{self.sign_el},{self.sign_wr},{self.sign_wp},{self.sign_pen}]"
         )
 
-    # ---------- Subscribers ----------
-    def _on_vl53_long(self, msg: Range):
-        # only update z when explicitly enabled
-        if not self.use_vl53_for_z:
-            return
-        if msg.range is None or math.isnan(msg.range) or msg.range <= 0.0:
-            return
-        self._zPlane_cm = (msg.range * 100.0) + self.z_offset_cm
-
-    def _on_uv(self, msg: Point):
-        self._last_u = float(msg.x)
-        self._last_v = float(msg.y)
-        self._last_pen_down = (float(msg.z) >= 0.5)
-        self._have_uv = True
-
-    # ---------- Workspace & mapping ----------
-    def calculate_workspace(self, zDistanceCm: float):
-        r_max_total = self.L1_cm + self.L2_cm + self.L3_cm
-        r_max_total_sq = r_max_total * r_max_total
-        z_dist_sq = zDistanceCm * zDistanceCm
-
-        if z_dist_sq >= r_max_total_sq:
-            xHalfSpan = 0.0
-        else:
-            xHalfSpan = math.sqrt(r_max_total_sq - z_dist_sq)
-
-        r_max_L1_L2 = self.L1_cm + self.L2_cm
-        r_max_L1_L2_sq = r_max_L1_L2 * r_max_L1_L2
-
-        r_wrist_at_X_zero = zDistanceCm - self.L3_cm
-        r_wrist_sq = r_wrist_at_X_zero * r_wrist_at_X_zero
-
-        if r_wrist_sq >= r_max_L1_L2_sq:
-            yHalfSpan = 0.0
-        else:
-            yHalfSpan = math.sqrt(r_max_L1_L2_sq - r_wrist_sq)
-
-        return xHalfSpan, yHalfSpan
-
-    def map_to_robot_space_3d(self, u01: float, v01: float, penDown: bool):
-        # lock Z when not using sensor
-        if not self.use_vl53_for_z:
-            self._zPlane_cm = self._zPlane_cm_fixed
-
-        xHalf, yHalf = self.calculate_workspace(self._zPlane_cm)
-        draw_area = (2.0 * yHalf) if self.use_yspan_as_draw_area else (2.0 * xHalf)
-
-        Xr_cm = (2.0 * u01 - 1.0) * draw_area
-        Yr_cm = (2.0 * v01 - 1.0) * draw_area
-        Zr_cm = self._zPlane_cm
-        return Xr_cm, Yr_cm, Zr_cm, draw_area
-
-    # ---------- IK ----------
-    def solve_ik_3d_with_base(self, Xr_cm, Yr_cm, Zr_cm, elbow_up_mode):
-        theta0 = math.atan2(Xr_cm, Zr_cm)
-
-        r_target = math.sqrt(Xr_cm * Xr_cm + Zr_cm * Zr_cm)
-        y_target = Yr_cm
-
-        r_wrist = r_target - self.L3_cm
-        y_wrist = y_target
-
-        d_sq = r_wrist * r_wrist + y_wrist * y_wrist
-        L1_sq = self.L1_cm * self.L1_cm
-        L2_sq = self.L2_cm * self.L2_cm
-
-        cosTheta2 = (d_sq - L1_sq - L2_sq) / (2.0 * self.L1_cm * self.L2_cm)
-        cosTheta2 = max(-1.0, min(1.0, cosTheta2))
-
-        theta2 = math.acos(cosTheta2)
-        if elbow_up_mode:
-            theta2 = -theta2
-
-        k1 = self.L1_cm + self.L2_cm * math.cos(theta2)
-        k2 = self.L2_cm * math.sin(theta2)
-
-        theta1 = math.atan2(y_wrist, r_wrist) - math.atan2(k2, k1)
-        theta3 = -(theta1 + theta2)
-
-        deg0 = math.degrees(theta0)
-        deg1 = math.degrees(theta1)
-        deg2 = math.degrees(theta2)
-        deg3 = math.degrees(theta3)
-
-        degBase = self.base_offset_deg + (deg0 * self.base_scale)
-        degShoulder = self.shoulder_offset_deg - (deg1 * self.shoulder_scale)
-        degElbow = self.elbow_offset_deg + (deg2 * self.elbow_scale)
-        degWrist = self.wrist_offset_deg - (deg3 * self.wrist_scale)
-
-        return degBase, degShoulder, degElbow, degWrist
-
-    # ---------- Auto draw square ----------
-    def _build_auto_square_path(self):
-        self._auto_path = []
-        half = max(0.0, min(1.0, self.auto_square_side_uv)) * 0.5
-        cx, cy = 0.5, 0.5
-
-        n = max(2, int(self.auto_points_per_side))
-
-        def lerp(a, b, t):
-            return a + (b - a) * t
-
-        # bottom
-        for i in range(n):
-            t = i / float(n - 1)
-            self._auto_path.append((lerp(cx - half, cx + half, t), cy - half, True))
-        # right
-        for i in range(1, n):
-            t = i / float(n - 1)
-            self._auto_path.append((cx + half, lerp(cy - half, cy + half, t), True))
-        # top
-        for i in range(1, n):
-            t = i / float(n - 1)
-            self._auto_path.append((lerp(cx + half, cx - half, t), cy + half, True))
-        # left
-        for i in range(1, n - 1):
-            t = i / float(n - 1)
-            self._auto_path.append((cx - half, lerp(cy + half, cy - half, t), True))
-
-        self._auto_index = 0
-        self._auto_next_time = self.get_clock().now().nanoseconds / 1e9
-
-    def _maybe_advance_auto(self, now_s: float):
-        if not self._auto_path:
+    def _on_xyz(self, msg: Point):
+        now = time.monotonic()
+        if self._min_period > 0 and (now - self._last_pub_t) < self._min_period:
             return
 
-        if now_s < self._auto_next_time:
+        x = float(msg.x)
+        y = float(msg.y)
+        z = float(msg.z)
+
+        sol = self.solve_ik(x, y, z)
+        if sol is None:
+            self.get_logger().warn(f"IK failed for target (cm)=({x:.2f},{y:.2f},{z:.2f})")
             return
 
-        u, v, pen = self._auto_path[self._auto_index]
-        self._auto_index += 1
-        if self._auto_index >= len(self._auto_path):
-            if self.auto_loop:
-                self._auto_index = 0
-            else:
-                self.auto_draw = False
-                return
+        self._last_q = sol
+        ik_deg = [math.degrees(a) for a in sol]
+        cmd_deg = self.map_geo_deg_to_cmd_deg(ik_deg)
 
-        self._last_u = u
-        self._last_v = v
-        self._last_pen_down = pen
-        self._have_uv = True
-
-        self._auto_next_time = now_s + self.auto_point_interval
-
-    # ---------- Main loop ----------
-    def _tick(self):
-        now = self.get_clock().now().nanoseconds / 1e9
-
-        if self.auto_draw:
-            self._maybe_advance_auto(now)
-
-        if not self._have_uv:
-            return
-
-        # throttle send
-        if (now - self._last_send_time) < self.send_interval:
-            return
-
-        u = max(0.0, min(1.0, self._last_u))
-        v = max(0.0, min(1.0, self._last_v))
-        pen = bool(self._last_pen_down)
-
-        Xr_cm, Yr_cm, Zr_cm, draw_area = self.map_to_robot_space_3d(u, v, pen)
-
-        dbg = Point()
-        dbg.x = float(Xr_cm)
-        dbg.y = float(Yr_cm)
-        dbg.z = float(Zr_cm)
-        self.pub_debug_target.publish(dbg)
-
-        if not pen:
-            return
-
-        degBase, degShoulder, degElbow, degWrist = self.solve_ik_3d_with_base(
-            Xr_cm, Yr_cm, Zr_cm, self.elbow_up
+        self.get_logger().info(
+            f"Target(cm)=({x:.2f},{y:.2f},{z:.2f}) | "
+            f"IK(deg) base={ik_deg[0]:.2f} sh={ik_deg[1]:.2f} el={ik_deg[2]:.2f} wr={ik_deg[3]:.2f} wp={ik_deg[4]:.2f} pen={ik_deg[5]:.2f} | "
+            f"CMD(deg) base={cmd_deg[0]:.2f} sh={cmd_deg[1]:.2f} el={cmd_deg[2]:.2f} wr={cmd_deg[3]:.2f} wp={cmd_deg[4]:.2f} pen={cmd_deg[5]:.2f}"
         )
 
-        dbg_js = JointState()
-        dbg_js.name = [self.joint_name_base, self.joint_name_shoulder, self.joint_name_elbow, self.joint_name_wrist]
-        dbg_js.position = [float(degBase), float(degShoulder), float(degElbow), float(degWrist)]
-        self.pub_debug_angles.publish(dbg_js)
+        self.publish_servo_cmd(cmd_deg)
+        self._last_pub_t = now
 
+    def map_geo_deg_to_cmd_deg(self, ik_deg):
+        base, sh, el, wr, wp, pen = ik_deg
+        return [
+            self.home + self.sign_base * base,
+            self.home + self.sign_sh * sh,
+            self.home + self.sign_el * el,
+            self.home + self.sign_wr * wr,
+            self.home + self.sign_wp * wp,
+            self.home + self.sign_pen * pen,
+        ]
+
+    def publish_servo_cmd(self, cmd_deg):
         cmd = JointState()
-        cmd.name = [self.joint_name_base, self.joint_name_shoulder, self.joint_name_elbow, self.joint_name_wrist]
-        cmd.position = [float(degBase), float(degShoulder), float(degElbow), float(degWrist)]
-        self.pub_servo_cmd.publish(cmd)
+        cmd.name = [self.j_base, self.j_shoulder, self.j_elbow, self.j_wroll, self.j_wpitch, self.j_pen]
+        cmd.position = [float(v) for v in cmd_deg]
+        self.pub_cmd.publish(cmd)
 
-        self._last_send_time = now
+    def solve_ik(self, x_tip, y_tip, z_tip):
+        # Tool constraint (current model): tool_z -> +X0
+        # Wrist_pitch point = tip - Ltool along +X0
+        xw = x_tip - self.Ltool
+        yw = y_tip
+        zw = z_tip
+
+        # Base yaw (geometry)
+        q1 = math.atan2(yw, xw)
+
+        # Shoulder/elbow planar
+        r = math.sqrt(xw * xw + yw * yw)
+        zp = zw - self.d1
+
+        D = math.sqrt(r * r + zp * zp)
+        if D < 1e-6:
+            return None
+        if D > (self.L2 + self.L3) + 1e-6 or D < abs(self.L2 - self.L3) - 1e-6:
+            return None
+
+        c3 = (D * D - self.L2 * self.L2 - self.L3 * self.L3) / (2.0 * self.L2 * self.L3)
+        c3 = clamp(c3, -1.0, 1.0)
+
+        q3a = math.acos(c3)
+        q3b = -q3a
+
+        def q2_for(q3):
+            phi = math.atan2(zp, r)
+            psi = math.atan2(self.L3 * math.sin(q3), self.L2 + self.L3 * math.cos(q3))
+            return phi - psi
+
+        q2a = q2_for(q3a)
+        q2b = q2_for(q3b)
+
+        cands = [(q1, q2a, q3a), (q1, q2b, q3b)]
+        if self._last_q is None:
+            q1, q2, q3 = cands[1] if self.elbow_up else cands[0]
+        else:
+            best = None
+            best_cost = 1e18
+            for (a1, a2, a3) in cands:
+                cost = abs(wrap_pi(a2 - self._last_q[1])) + abs(wrap_pi(a3 - self._last_q[2]))
+                if cost < best_cost:
+                    best_cost = cost
+                    best = (a1, a2, a3)
+            q1, q2, q3 = best
+
+        # Wrist orientation (kept as before; you will validate with real robot)
+        R03 = matmul(rotz(q1), roty(q2 + q3))
+        R30 = matT(R03)
+
+        # pick a consistent R06 with z_tool=+X0 (only constraint we know)
+        R06 = [
+            [0.0, 0.0, 1.0],
+            [0.0, 1.0, 0.0],
+            [-1.0, 0.0, 0.0],
+        ]
+        R36 = matmul(R30, R06)
+
+        # solve Rx(q4)Ry(q5)Rz(q6)
+        s5 = clamp(R36[0][2], -1.0, 1.0)
+        q5_1 = math.asin(s5)
+        q5_2 = math.pi - q5_1
+
+        def q4_q6_for(q5):
+            c5 = math.cos(q5)
+            if abs(c5) < 1e-6:
+                q6 = self._last_q[5] if self._last_q is not None else self.pen_roll_default
+                q4 = 0.0
+                return q4, q6
+            q4 = math.atan2(-R36[1][2], R36[2][2])
+            q6 = math.atan2(-R36[0][1], R36[0][0])
+            return q4, q6
+
+        wrist = []
+        for q5c in (q5_1, q5_2):
+            q4c, q6c = q4_q6_for(q5c)
+            wrist.append((q4c, q5c, q6c))
+
+        if self._last_q is None:
+            # bias q6 to default
+            q4, q5, q6 = min(wrist, key=lambda t: abs(wrap_pi(t[2] - self.pen_roll_default)))
+        else:
+            q4, q5, q6 = min(
+                wrist,
+                key=lambda t: abs(wrap_pi(t[0] - self._last_q[3])) + abs(wrap_pi(t[1] - self._last_q[4])) + abs(wrap_pi(t[2] - self._last_q[5])),
+            )
+
+        return (q1, q2, q3, q4, q5, q6)
 
 
 def main():
     rclpy.init()
-    node = RoboArmDrawingIKNode()
+    node = RoboArmIKXYZNode()
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
